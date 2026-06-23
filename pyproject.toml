@@ -1,0 +1,13 @@
+[project]
+name = "agent-eye"
+version = "0.1.0"
+description = "Windows GUI automation MCP plugin for Reasonix — lets the agent see and control your desktop via Windows UI Automation."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.scripts]
+agent-eye = "agent_eye.__main__:main"
+
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
