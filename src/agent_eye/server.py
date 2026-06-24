@@ -20,6 +20,13 @@ from .config import monitor_bounds
 from .perception import uia, screenshot as _ss
 from .action import executor as _exec
 
+# OmniParser is optional — only available if torch + ultralytics + transformers are installed.
+try:
+    from .perception import omniparser as _omni
+    _OMNI_AVAILABLE = True
+except ImportError:
+    _OMNI_AVAILABLE = False
+
 # --- MCP constants ---
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "agent-eye"
@@ -202,6 +209,37 @@ _TOOLS: list[dict[str, Any]] = [
             "title": "Capture screenshot",
         },
     },
+    {
+        "name": "omniparser_parse",
+        "description": (
+            "Parse the current screen using Microsoft OmniParser — a pure vision "
+            "model that detects UI elements from screenshots using YOLO + Florence. "
+            "Use this when uia_get_elements returns few/no results (custom-drawn "
+            "UIs, Chrome, VS Code, games, Unity Scene view). Returns a numbered "
+            "list with element IDs, labels, bounding rectangles, and whether each "
+            "element is interactive. NOTE: first call loads ~1.5GB of models; "
+            "subsequent calls are fast (~1-2s on GPU, ~5-10s on CPU)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "box_threshold": {
+                    "type": "number",
+                    "description": "YOLO confidence threshold (0.0-1.0, default 0.05). Lower = more elements.",
+                    "default": 0.05,
+                },
+                "max_elements": {
+                    "type": "integer",
+                    "description": "Maximum elements to return (default 100, max 150).",
+                    "default": 100,
+                },
+            },
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "title": "OmniParser screen analysis",
+        },
+    },
 ]
 
 
@@ -279,16 +317,32 @@ def _sanitize_text(text: str) -> tuple[str, list[str]]:
 def _handle_uia_get_elements(args: dict[str, Any]) -> str:
     global _last_elements, _last_elements_time
     max_el = min(int(args.get("max_elements", 80)), 120)
+    use_omni = args.get("use_omniparser", False) if isinstance(args.get("use_omniparser"), bool) else False
     elements = uia.get_elements(max_elements=max_el)
     _last_elements = elements
     _last_elements_time = _time.time()
-    _reset_circuit_breaker()  # fresh perception resets circuit
+    _reset_circuit_breaker()
     text = uia.flatten_for_llm(elements)
     mb = monitor_bounds()
     header = (
         f"Monitor [{mb['left']},{mb['top']} {mb['width']}x{mb['height']}]: "
-        f"{len(elements)} interactive elements\n\n"
+        f"{len(elements)} UIA interactive elements\n\n"
     )
+
+    # Auto-fallback: if UIA found very few elements, try OmniParser.
+    if len(elements) < 3 and not use_omni and _OMNI_AVAILABLE:
+        try:
+            omni_text = _handle_omniparser_parse({"max_elements": max_el})
+            header += "\n--- OmniParser fallback (UIA blind area) ---\n\n"
+            return header + text + "\n\n" + omni_text
+        except Exception as e:
+            header += f"\n(OmniParser fallback failed: {e})\n"
+    elif len(elements) < 3 and not _OMNI_AVAILABLE:
+        header += (
+            "\nTIP: Install OmniParser for vision-based element detection "
+            "on custom UIs: pip install ultralytics transformers torch easyocr\n"
+        )
+
     return header + text
 
 
@@ -425,6 +479,43 @@ def _handle_screenshot(args: dict[str, Any]) -> dict[str, Any]:
     return _image_result(b64, desc)
 
 
+def _handle_omniparser_parse(args: dict[str, Any]) -> str:
+    """Parse screen with OmniParser (pure vision, works on any UI)."""
+    if not _OMNI_AVAILABLE:
+        raise RuntimeError(
+            "OmniParser not installed. Run: "
+            "pip install ultralytics transformers torch easyocr"
+        )
+    box_threshold = float(args.get("box_threshold", 0.05))
+    max_el = min(int(args.get("max_elements", 100)), 150)
+
+    # Save screenshot to temp file for OmniParser.
+    import tempfile
+    import os as _os
+    img = _ss.capture()
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        img.save(f, format="PNG")
+        tmp_path = f.name
+
+    try:
+        elements = _omni.parse_screenshot(
+            tmp_path,
+            box_threshold=box_threshold,
+            max_elements=max_el,
+        )
+    finally:
+        _os.unlink(tmp_path)
+
+    text = _omni.flatten_for_llm(elements)
+    mb = monitor_bounds()
+    header = (
+        f"OmniParser: Monitor [{mb['left']},{mb['top']} "
+        f"{mb['width']}x{mb['height']}]: {len(elements)} elements "
+        f"(pure vision — works on any UI)\n\n"
+    )
+    return header + text
+
+
 _TOOL_HANDLERS: dict[str, Any] = {
     "uia_get_elements": _handle_uia_get_elements,
     "uia_click": _handle_click,
@@ -434,6 +525,7 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "uia_hotkey": _handle_hotkey,
     "uia_scroll": _handle_scroll,
     "screenshot_capture": _handle_screenshot,
+    "omniparser_parse": _handle_omniparser_parse,
 }
 
 
